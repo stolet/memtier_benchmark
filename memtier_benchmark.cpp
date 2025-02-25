@@ -1154,6 +1154,7 @@ run_stats run_benchmark(int run_id, benchmark_config* cfg, object_generator* obj
     for (std::vector<cg_thread*>::iterator i = threads.begin(); i != threads.end(); i++) {
         (*i)->start();
     }
+    sleep(5);
 
     unsigned long int prev_ops = 0;
     unsigned long int prev_bytes = 0;
