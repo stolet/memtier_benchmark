@@ -1065,10 +1065,11 @@ struct cg_thread {
     client_group* m_cg;
     abstract_protocol* m_protocol;
     pthread_t m_thread;
+    pthread_barrier_t* m_prep_barrier;
     bool m_finished;
 
-    cg_thread(unsigned int id, benchmark_config* config, object_generator* obj_gen) :
-        m_thread_id(id), m_config(config), m_obj_gen(obj_gen), m_cg(NULL), m_protocol(NULL), m_finished(false)
+    cg_thread(unsigned int id, benchmark_config* config, object_generator* obj_gen, pthread_barrier_t* prep_barrier) :
+        m_thread_id(id), m_config(config), m_obj_gen(obj_gen), m_cg(NULL), m_protocol(NULL), m_prep_barrier(prep_barrier), m_finished(false)
     {
         m_protocol = protocol_factory(m_config->protocol);
         assert(m_protocol != NULL);
@@ -1112,6 +1113,12 @@ struct cg_thread {
 static void* cg_thread_start(void *t)
 {
     cg_thread* thread = (cg_thread*) t;
+    if (thread->prepare() < 0) {
+        benchmark_error_log("error: failed to prepare thread %u for test.\n", thread->m_thread_id);
+        exit(1);
+    }
+    pthread_barrier_wait(thread->m_prep_barrier);
+
     thread->m_cg->run();
     thread->m_finished = true;
 
@@ -1134,18 +1141,16 @@ void size_to_str(unsigned long int size, char *buf, int buf_len)
 
 run_stats run_benchmark(int run_id, benchmark_config* cfg, object_generator* obj_gen)
 {
+    pthread_barrier_t barrier;
     fprintf(stderr, "[RUN #%u] Preparing benchmark client...\n", run_id);
+    pthread_barrier_init(&barrier, NULL, cfg->threads + 1);
 
     // prepare threads data
     std::vector<cg_thread*> threads;
     for (unsigned int i = 0; i < cfg->threads; i++) {
-        cg_thread* t = new cg_thread(i, cfg, obj_gen);
+        cg_thread* t = new cg_thread(i, cfg, obj_gen, &barrier);
         assert(t != NULL);
 
-        if (t->prepare() < 0) {
-            benchmark_error_log("error: failed to prepare thread %u for test.\n", i);
-            exit(1);
-        }
         threads.push_back(t);
     }
 
@@ -1154,7 +1159,9 @@ run_stats run_benchmark(int run_id, benchmark_config* cfg, object_generator* obj
     for (std::vector<cg_thread*>::iterator i = threads.begin(); i != threads.end(); i++) {
         (*i)->start();
     }
-    sleep(5);
+    sleep(10);
+
+    pthread_barrier_wait(&barrier);
 
     unsigned long int prev_ops = 0;
     unsigned long int prev_bytes = 0;
