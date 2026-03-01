@@ -32,6 +32,7 @@
 #include <errno.h>
 #include <sys/time.h>
 #include <sys/resource.h>
+#include <time.h>
 
 #ifdef USE_TLS
 #include <openssl/crypto.h>
@@ -55,6 +56,11 @@
 #endif
 
 #include <cstring>
+#include <cmath>
+#include <limits>
+#include <atomic>
+#include <random>
+#include <string>
 #include <stdexcept>
 
 #include "client.h"
@@ -103,6 +109,308 @@ static const char * get_protocol_name(enum PROTOCOL_TYPE type) {
     else if (type == PROTOCOL_MEMCACHE_TEXT) return "memcache_text";
     else if (type == PROTOCOL_MEMCACHE_BINARY) return "memcache_binary";
     else return "none";
+}
+
+enum burst_distribution_type {
+    burst_dist_constant,
+    burst_dist_normal,
+    burst_dist_lognormal
+};
+
+struct burst_distribution_spec {
+    burst_distribution_type type;
+    double param1;
+    double param2;
+};
+
+static bool parse_finite_double(const char* text, double* out)
+{
+    char* end = NULL;
+    errno = 0;
+    double value = strtod(text, &end);
+    if (errno != 0 || end == NULL || *end != '\0' || !std::isfinite(value)) {
+        return false;
+    }
+
+    *out = value;
+    return true;
+}
+
+static bool parse_burst_distribution_spec(const char* raw_spec, burst_distribution_spec* out,
+                                          const char* option_name, bool print_errors = true)
+{
+    if (raw_spec == NULL || out == NULL) {
+        if (print_errors) {
+            fprintf(stderr, "error: %s requires a distribution spec.\n", option_name);
+        }
+        return false;
+    }
+
+    const char* spec = raw_spec;
+    const char* colon = strchr(raw_spec, ':');
+    if (colon != NULL && *(colon + 1) != '\0') {
+        // Allow "label:dist,..." while using the part after ':'.
+        spec = colon + 1;
+    }
+
+    char* spec_copy = strdup(spec);
+    if (spec_copy == NULL) {
+        if (print_errors) {
+            fprintf(stderr, "error: out of memory parsing %s.\n", option_name);
+        }
+        return false;
+    }
+
+    bool ok = false;
+    const char* delimiter = ",";
+    char* saveptr = NULL;
+    char* token = strtok_r(spec_copy, delimiter, &saveptr);
+    if (token == NULL) {
+        goto done;
+    }
+
+    if (strcmp(token, "constant") == 0) {
+        char* value_token = strtok_r(NULL, delimiter, &saveptr);
+        char* trailing = strtok_r(NULL, delimiter, &saveptr);
+        double value = 0.0;
+        if (value_token == NULL || trailing != NULL || !parse_finite_double(value_token, &value) || value < 0.0) {
+            goto done;
+        }
+        out->type = burst_dist_constant;
+        out->param1 = value;
+        out->param2 = 0.0;
+        ok = true;
+    } else if (strcmp(token, "normal") == 0) {
+        char* mean_token = strtok_r(NULL, delimiter, &saveptr);
+        char* stddev_token = strtok_r(NULL, delimiter, &saveptr);
+        char* trailing = strtok_r(NULL, delimiter, &saveptr);
+        double mean = 0.0;
+        double stddev = 0.0;
+        if (mean_token == NULL || stddev_token == NULL || trailing != NULL ||
+            !parse_finite_double(mean_token, &mean) ||
+            !parse_finite_double(stddev_token, &stddev) ||
+            stddev < 0.0) {
+            goto done;
+        }
+        out->type = burst_dist_normal;
+        out->param1 = mean;
+        out->param2 = stddev;
+        ok = true;
+    } else if (strcmp(token, "lognormal") == 0) {
+        char* mu_token = strtok_r(NULL, delimiter, &saveptr);
+        char* sigma_token = strtok_r(NULL, delimiter, &saveptr);
+        char* trailing = strtok_r(NULL, delimiter, &saveptr);
+        double mu = 0.0;
+        double sigma = 0.0;
+        if (mu_token == NULL || sigma_token == NULL || trailing != NULL ||
+            !parse_finite_double(mu_token, &mu) ||
+            !parse_finite_double(sigma_token, &sigma) ||
+            sigma < 0.0) {
+            goto done;
+        }
+        out->type = burst_dist_lognormal;
+        out->param1 = mu;
+        out->param2 = sigma;
+        ok = true;
+    }
+
+done:
+    if (!ok && print_errors) {
+        fprintf(stderr,
+                "error: %s must be one of: constant,<x> | normal,<mean>,<stddev> | lognormal,<mu>,<sigma>.\n",
+                option_name);
+    }
+
+    free(spec_copy);
+    return ok;
+}
+
+static double sample_burst_distribution(const burst_distribution_spec& spec, std::mt19937_64* rng)
+{
+    if (spec.type == burst_dist_constant) {
+        return spec.param1;
+    }
+
+    if (spec.type == burst_dist_normal) {
+        std::normal_distribution<double> distribution(spec.param1, spec.param2);
+        double value = distribution(*rng);
+        return value < 0.0 ? 0.0 : value;
+    }
+
+    std::lognormal_distribution<double> distribution(spec.param1, spec.param2);
+    return distribution(*rng);
+}
+
+struct burst_controller::impl {
+    explicit impl(const benchmark_config* cfg) :
+        high_rate(cfg->burst_intensity_high),
+        low_rate(cfg->burst_intensity_low),
+        running(false),
+        started(false),
+        current_total_rate(low_rate),
+        rate_generation(0),
+        phase_end_time_ns(0),
+        current_phase(0),
+        debug(cfg->debug > 0)
+    {
+        if (!parse_burst_distribution_spec(cfg->burst_interval_spec, &interval_distribution, "--burst-interval", false)) {
+            throw std::runtime_error("failed to parse --burst-interval");
+        }
+        if (!parse_burst_distribution_spec(cfg->burst_duration_spec, &duration_distribution, "--burst-duration", false)) {
+            throw std::runtime_error("failed to parse --burst-duration");
+        }
+
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        uint64_t seed = ((uint64_t) ts.tv_sec << 32) ^ (uint64_t) ts.tv_nsec ^ (uint64_t) getpid();
+        rng.seed(seed);
+    }
+
+    static void* thread_main(void* arg)
+    {
+        impl* self = (impl *) arg;
+        self->run();
+        return arg;
+    }
+
+    uint64_t now_ns() const
+    {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        return ((uint64_t) now.tv_sec * 1000000000ULL) + (uint64_t) now.tv_nsec;
+    }
+
+    void sleep_until(uint64_t target_ns)
+    {
+        while (running.load(std::memory_order_relaxed)) {
+            uint64_t now = now_ns();
+            if (now >= target_ns) {
+                break;
+            }
+
+            uint64_t remaining_ns = target_ns - now;
+            if (remaining_ns > 10000000ULL) {
+                remaining_ns = 10000000ULL;
+            }
+
+            struct timespec delay = {
+                (time_t) (remaining_ns / 1000000000ULL),
+                (long) (remaining_ns % 1000000000ULL)
+            };
+            nanosleep(&delay, NULL);
+        }
+    }
+
+    void run()
+    {
+        bool high_phase = false;
+        while (running.load(std::memory_order_relaxed)) {
+            const double sampled_ms = high_phase
+                ? sample_burst_distribution(duration_distribution, &rng)
+                : sample_burst_distribution(interval_distribution, &rng);
+            uint64_t phase_duration_ns = 0;
+            if (sampled_ms > 0.0) {
+                const double ns = sampled_ms * 1000000.0;
+                if (ns > (double) std::numeric_limits<uint64_t>::max()) {
+                    phase_duration_ns = std::numeric_limits<uint64_t>::max();
+                } else {
+                    phase_duration_ns = (uint64_t) llround(ns);
+                }
+            }
+
+            const double rate = high_phase ? high_rate : low_rate;
+            const uint64_t start_ns = now_ns();
+            const uint64_t end_ns = start_ns + phase_duration_ns;
+
+            current_phase.store(high_phase ? 1 : 0, std::memory_order_release);
+            current_total_rate.store(rate, std::memory_order_release);
+            phase_end_time_ns.store(end_ns, std::memory_order_release);
+            const uint64_t generation = rate_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
+
+            if (debug) {
+                benchmark_debug_log("burst phase=%s generation=%llu rate=%.6f sampled_ms=%.6f start_ns=%llu end_ns=%llu\n",
+                                    high_phase ? "HIGH" : "LOW",
+                                    (unsigned long long) generation,
+                                    rate,
+                                    sampled_ms,
+                                    (unsigned long long) start_ns,
+                                    (unsigned long long) end_ns);
+            }
+
+            if (phase_duration_ns > 0) {
+                sleep_until(end_ns);
+            }
+
+            high_phase = !high_phase;
+        }
+    }
+
+    burst_distribution_spec interval_distribution;
+    burst_distribution_spec duration_distribution;
+    double high_rate;
+    double low_rate;
+
+    std::atomic<bool> running;
+    bool started;
+    pthread_t thread;
+    std::mt19937_64 rng;
+
+    std::atomic<double> current_total_rate;
+    std::atomic<uint64_t> rate_generation;
+    std::atomic<uint64_t> phase_end_time_ns;
+    std::atomic<int> current_phase;
+
+    bool debug;
+};
+
+burst_controller::burst_controller(const benchmark_config* cfg)
+    : m_impl(new impl(cfg))
+{
+}
+
+burst_controller::~burst_controller()
+{
+    stop();
+    delete m_impl;
+    m_impl = NULL;
+}
+
+int burst_controller::start()
+{
+    if (m_impl->started) {
+        return 0;
+    }
+
+    m_impl->running.store(true, std::memory_order_release);
+    int ret = pthread_create(&m_impl->thread, NULL, impl::thread_main, (void *) m_impl);
+    if (ret != 0) {
+        m_impl->running.store(false, std::memory_order_release);
+        return ret;
+    }
+
+    m_impl->started = true;
+    return 0;
+}
+
+void burst_controller::stop()
+{
+    if (!m_impl->started) {
+        return;
+    }
+
+    m_impl->running.store(false, std::memory_order_release);
+    pthread_join(m_impl->thread, NULL);
+    m_impl->started = false;
+}
+
+double burst_controller::get_current_total_rate() const
+{
+    return m_impl->current_total_rate.load(std::memory_order_acquire);
+}
+
+uint64_t burst_controller::get_rate_generation() const
+{
+    return m_impl->rate_generation.load(std::memory_order_acquire);
 }
 
 static void config_print(FILE *file, struct benchmark_config *cfg)
@@ -210,6 +518,18 @@ static void config_print(FILE *file, struct benchmark_config *cfg)
         cfg->num_slaves.min, cfg->num_slaves.max,
         cfg->wait_timeout.min, cfg->wait_timeout.max,
         cfg->json_out_file);
+
+    fprintf(file,
+        "burst = %s\n"
+        "burst-intensity-high = %.6f\n"
+        "burst-intensity-low = %.6f\n"
+        "burst-interval = %s\n"
+        "burst-duration = %s\n",
+        cfg->burst ? "yes" : "no",
+        cfg->burst_intensity_high,
+        cfg->burst_intensity_low,
+        cfg->burst_interval_spec ? cfg->burst_interval_spec : "",
+        cfg->burst_duration_spec ? cfg->burst_duration_spec : "");
 }
 
 static void config_print_to_json(json_handler * jsonhandler, struct benchmark_config *cfg)
@@ -267,6 +587,11 @@ static void config_print_to_json(json_handler * jsonhandler, struct benchmark_co
     jsonhandler->write_obj("wait-ratio"        ,"\"%u:%u\"",    cfg->wait_ratio.a, cfg->wait_ratio.b);
     jsonhandler->write_obj("num-slaves"        ,"\"%u:%u\"",    cfg->num_slaves.min, cfg->num_slaves.max);
     jsonhandler->write_obj("wait-timeout"      ,"\"%u-%u\"",   	cfg->wait_timeout.min, cfg->wait_timeout.max);
+    jsonhandler->write_obj("burst"             ,"\"%s\"",       cfg->burst ? "true" : "false");
+    jsonhandler->write_obj("burst-intensity-high", "%f",         cfg->burst_intensity_high);
+    jsonhandler->write_obj("burst-intensity-low",  "%f",         cfg->burst_intensity_low);
+    jsonhandler->write_obj("burst-interval"    ,"\"%s\"",       cfg->burst_interval_spec ? cfg->burst_interval_spec : "");
+    jsonhandler->write_obj("burst-duration"    ,"\"%s\"",       cfg->burst_duration_spec ? cfg->burst_duration_spec : "");
 
     jsonhandler->close_nesting();
 }
@@ -317,6 +642,7 @@ static void config_init_defaults(struct benchmark_config *cfg)
     if (!cfg->tls_protocols)
         cfg->tls_protocols = REDIS_TLS_PROTO_DEFAULT;
 #endif
+    cfg->burst_controller_state = NULL;
 }
 
 static int generate_random_seed()
@@ -380,6 +706,57 @@ static bool verify_arbitrary_command_option(struct benchmark_config *cfg) {
     return true;
 }
 
+static bool parse_burst_intensity_option(const char* arg, double* value_out, const char* option_name)
+{
+    double value = 0.0;
+    if (!parse_finite_double(arg, &value)) {
+        fprintf(stderr, "error: %s must be numeric.\n", option_name);
+        return false;
+    }
+
+    const double epsilon = 1e-12;
+    if (value < 0.0 && fabs(value + 1.0) > epsilon) {
+        fprintf(stderr, "error: %s must be >= 0, or exactly -1 for unthrottled.\n", option_name);
+        return false;
+    }
+
+    *value_out = value;
+    return true;
+}
+
+static bool verify_burst_options(struct benchmark_config *cfg)
+{
+    if (!cfg->burst) {
+        if (cfg->burst_intensity_high_set || cfg->burst_intensity_low_set ||
+            cfg->burst_interval_spec_set || cfg->burst_duration_spec_set) {
+            fprintf(stderr, "error: burst-specific options require --burst.\n");
+            return false;
+        }
+        return true;
+    }
+
+    if (cfg->request_rate) {
+        fprintf(stderr, "error: --burst cannot be used together with --rate-limiting.\n");
+        return false;
+    }
+
+    if (!cfg->burst_intensity_high_set || !cfg->burst_intensity_low_set ||
+        !cfg->burst_interval_spec_set || !cfg->burst_duration_spec_set) {
+        fprintf(stderr, "error: --burst requires --burst-intensity-high, --burst-intensity-low, --burst-interval and --burst-duration.\n");
+        return false;
+    }
+
+    burst_distribution_spec tmp;
+    if (!parse_burst_distribution_spec(cfg->burst_interval_spec, &tmp, "--burst-interval")) {
+        return false;
+    }
+    if (!parse_burst_distribution_spec(cfg->burst_duration_spec, &tmp, "--burst-duration")) {
+        return false;
+    }
+
+    return true;
+}
+
 static int config_parse_args(int argc, char *argv[], struct benchmark_config *cfg)
 {
     enum extended_options {
@@ -428,6 +805,11 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         o_tls_protocols,
         o_hdr_file_prefix,
         o_rate_limiting,
+        o_burst,
+        o_burst_intensity_high,
+        o_burst_intensity_low,
+        o_burst_interval,
+        o_burst_duration,
         o_help
     };
 
@@ -497,6 +879,11 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         { "command-key-pattern",        1, 0, o_command_key_pattern },
         { "command-ratio",              1, 0, o_command_ratio },
         { "rate-limiting",              1, 0, o_rate_limiting },
+        { "burst",                      0, 0, o_burst },
+        { "burst-intensity-high",       1, 0, o_burst_intensity_high },
+        { "burst-intensity-low",        1, 0, o_burst_intensity_low },
+        { "burst-interval",             1, 0, o_burst_interval },
+        { "burst-duration",             1, 0, o_burst_duration },
         { NULL,                         0, 0, 0 }
     };
 
@@ -878,6 +1265,39 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
                     }
                     break;
                 }
+                case o_burst:
+                    cfg->burst = true;
+                    break;
+                case o_burst_intensity_high:
+                    if (!parse_burst_intensity_option(optarg, &cfg->burst_intensity_high, "--burst-intensity-high")) {
+                        return -1;
+                    }
+                    cfg->burst_intensity_high_set = true;
+                    break;
+                case o_burst_intensity_low:
+                    if (!parse_burst_intensity_option(optarg, &cfg->burst_intensity_low, "--burst-intensity-low")) {
+                        return -1;
+                    }
+                    cfg->burst_intensity_low_set = true;
+                    break;
+                case o_burst_interval: {
+                    burst_distribution_spec parsed_spec;
+                    if (!parse_burst_distribution_spec(optarg, &parsed_spec, "--burst-interval")) {
+                        return -1;
+                    }
+                    cfg->burst_interval_spec = optarg;
+                    cfg->burst_interval_spec_set = true;
+                    break;
+                }
+                case o_burst_duration: {
+                    burst_distribution_spec parsed_spec;
+                    if (!parse_burst_distribution_spec(optarg, &parsed_spec, "--burst-duration")) {
+                        return -1;
+                    }
+                    cfg->burst_duration_spec = optarg;
+                    cfg->burst_duration_spec_set = true;
+                    break;
+                }
 #ifdef USE_TLS
                 case o_tls:
                     cfg->tls = true;
@@ -933,7 +1353,8 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
     }
 
     if ((cfg->cluster_mode && !verify_cluster_option(cfg)) ||
-        (cfg->arbitrary_commands->is_defined() && !verify_arbitrary_command_option(cfg))) {
+        (cfg->arbitrary_commands->is_defined() && !verify_arbitrary_command_option(cfg)) ||
+        !verify_burst_options(cfg)) {
         return -1;
     }
 
@@ -986,6 +1407,13 @@ void usage() {
             "                                 use 'allkeys' to run on the entire key-range\n"
             "      --rate-limiting=NUMBER     The max number of requests to make per second from an individual connection (default is unlimited rate).\n"
             "                                 If you use --rate-limiting and a very large rate is entered which cannot be met, memtier will do as many requests as possible per second.\n"
+            "      --burst                    Enable tenant-wide bursty open-loop rate control.\n"
+            "      --burst-intensity-high=VAL HIGH phase total target req/s for the whole process. Use -1 for unthrottled, 0 for no traffic.\n"
+            "      --burst-intensity-low=VAL  LOW phase total target req/s for the whole process. Use -1 for unthrottled, 0 for no traffic.\n"
+            "      --burst-interval=SPEC      LOW phase duration distribution in milliseconds:\n"
+            "                                 constant,<ms> | normal,<mean_ms>,<stddev_ms> | lognormal,<mu>,<sigma>\n"
+            "      --burst-duration=SPEC      HIGH phase duration distribution in milliseconds:\n"
+            "                                 constant,<ms> | normal,<mean_ms>,<stddev_ms> | lognormal,<mu>,<sigma>\n"
             "  -c, --clients=NUMBER           Number of clients per thread (default: 50)\n"
             "  -t, --threads=NUMBER           Number of threads (default: 4)\n"
             "      --test-time=SECS           Number of seconds to run the test\n"
@@ -1074,7 +1502,7 @@ struct cg_thread {
         m_protocol = protocol_factory(m_config->protocol);
         assert(m_protocol != NULL);
 
-        m_cg = new client_group(m_config, m_protocol, m_obj_gen);
+        m_cg = new client_group(m_config, m_protocol, m_obj_gen, m_thread_id);
     }
 
     ~cg_thread()
@@ -1141,6 +1569,25 @@ void size_to_str(unsigned long int size, char *buf, int buf_len)
 
 run_stats run_benchmark(int run_id, benchmark_config* cfg, object_generator* obj_gen)
 {
+    burst_controller* burst = NULL;
+    if (cfg->burst) {
+        try {
+            burst = new burst_controller(cfg);
+        } catch (const std::runtime_error& e) {
+            benchmark_error_log("error: failed to initialize burst controller: %s\n", e.what());
+            exit(1);
+        }
+        assert(burst != NULL);
+        if (burst->start() != 0) {
+            benchmark_error_log("error: failed to start burst controller thread.\n");
+            delete burst;
+            exit(1);
+        }
+        cfg->burst_controller_state = burst;
+    } else {
+        cfg->burst_controller_state = NULL;
+    }
+
     pthread_barrier_t barrier;
     fprintf(stderr, "[RUN #%u] Preparing benchmark client...\n", run_id);
     pthread_barrier_init(&barrier, NULL, cfg->threads + 1);
@@ -1259,6 +1706,12 @@ run_stats run_benchmark(int run_id, benchmark_config* cfg, object_generator* obj
         cg_thread* t = *threads.begin();
         threads.erase(threads.begin());
         delete t;
+    }
+
+    if (burst != NULL) {
+        burst->stop();
+        delete burst;
+        cfg->burst_controller_state = NULL;
     }
 
     return stats;

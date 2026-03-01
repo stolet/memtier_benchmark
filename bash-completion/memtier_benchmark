@@ -18,17 +18,18 @@ _memtier_look_for_element () {
 
 _memtier_completions()
 {
-  options_no_comp=("--server" "--port" "--unix-socket" "--out-file" "--client-stats" "--run-count" "--clients"\
-                   "--requests" "--threads" "--test-time" "--ratio" "--pipeline" "--data-size" "--data-offset"\
-                   "--data-size-range" "--data-size-list" "--expiry-range" "--data-import" "--key-prefix"\
-                   "--key-minimum" "--key-maximum" "--reconnect-interval" "--multi-key-get" "--authenticate"\
-                   "--select-db" "--wait-ratio" "--num-slaves" "--wait-timeout" "--json-out-file"\
-                   "--command" "--command-ratio" "-s" "-p" "-S" "-o" "-x" "-c" "-n" "-t" "-d" "-a")
+	 options_no_comp=("--server" "--port" "--unix-socket" "--out-file" "--client-stats" "--run-count" "--clients"\
+	                  "--requests" "--threads" "--test-time" "--ratio" "--pipeline" "--data-size" "--data-offset"\
+	                  "--data-size-range" "--data-size-list" "--expiry-range" "--data-import" "--key-prefix"\
+	                  "--key-minimum" "--key-maximum" "--reconnect-interval" "--multi-key-get" "--authenticate"\
+	                  "--select-db" "--wait-ratio" "--num-slaves" "--wait-timeout" "--json-out-file"\
+	                  "--command" "--command-ratio" "--burst-intensity-high" "--burst-intensity-low"\
+	                  "--burst-interval" "--burst-duration" "-s" "-p" "-S" "-o" "-x" "-c" "-n" "-t" "-d" "-a")
 
-  options_no_args=("--debug" "--show-config" "--hide-histogram" "--distinct-client-seed" "--randomize"\
-                   "--random-data" "--data-verify" "--verify-only" "--generate-keys" "--key-stddev"\
-                   "--key-median" "--no-expiry" "--cluster-mode" "--help" "--version"\
-                   "-D" "-R" "-h" "-v")
+	 options_no_args=("--debug" "--show-config" "--hide-histogram" "--distinct-client-seed" "--randomize"\
+	                  "--random-data" "--data-verify" "--verify-only" "--generate-keys" "--key-stddev"\
+	                  "--key-median" "--no-expiry" "--cluster-mode" "--burst" "--help" "--version"\
+	                  "-D" "-R" "-h" "-v")
 
   options_comp=("--protocol" "-P" "--key-pattern" "--data-size-pattern" "--command-key-pattern")
 

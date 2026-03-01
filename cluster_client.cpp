@@ -161,7 +161,8 @@ void cluster_client::disconnect(void)
 shard_connection* cluster_client::create_shard_connection(abstract_protocol* abs_protocol) {
     shard_connection* sc = new shard_connection(m_connections.size(), this,
                                                 m_config, m_event_base,
-                                                abs_protocol);
+                                                abs_protocol,
+                                                m_thread_rate_limiter);
     assert(sc != NULL);
 
     m_connections.push_back(sc);
@@ -497,4 +498,3 @@ void cluster_client::handle_response(unsigned int conn_id, struct timeval timest
     // continue with base class
     client::handle_response(conn_id, timestamp, request, response);
 }
-

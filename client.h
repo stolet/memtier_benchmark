@@ -62,6 +62,7 @@ protected:
 
     // test related
     benchmark_config* m_config;
+    thread_rate_limiter* m_thread_rate_limiter;
     object_generator* m_obj_gen;
     run_stats m_stats;
 
@@ -81,7 +82,8 @@ public:
     client(client_group* group);
     client(struct event_base *event_base, benchmark_config *config, abstract_protocol *protocol, object_generator *obj_gen);
     virtual ~client();
-    bool setup_client(benchmark_config *config, abstract_protocol *protocol, object_generator *obj_gen);
+    bool setup_client(benchmark_config *config, abstract_protocol *protocol, object_generator *obj_gen,
+                      thread_rate_limiter* rate_limiter);
     int prepare(void);
     bool initialized(void);
     run_stats* get_stats(void) { return &m_stats; }
@@ -198,9 +200,12 @@ protected:
     benchmark_config *m_config;
     abstract_protocol* m_protocol;
     object_generator* m_obj_gen;
+    unsigned int m_thread_id;
+    thread_rate_limiter* m_thread_rate_limiter;
     std::vector<client*> m_clients;
 public:
-    client_group(benchmark_config *cfg, abstract_protocol *protocol, object_generator* obj_gen);
+    client_group(benchmark_config *cfg, abstract_protocol *protocol, object_generator* obj_gen,
+                 unsigned int thread_id = 0);
     ~client_group();
 
     int create_clients(int count);
@@ -212,7 +217,8 @@ public:
     struct event_base *get_event_base(void) { return m_base; }
     benchmark_config *get_config(void) { return m_config; }
     abstract_protocol* get_protocol(void) { return m_protocol; }
-    object_generator* get_obj_gen(void) { return m_obj_gen; }    
+    object_generator* get_obj_gen(void) { return m_obj_gen; }
+    thread_rate_limiter* get_thread_rate_limiter(void) { return m_thread_rate_limiter; }
 
     unsigned long int get_total_bytes(void);
     unsigned long int get_total_ops(void);

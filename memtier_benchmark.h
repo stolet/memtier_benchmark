@@ -19,6 +19,7 @@
 #ifndef _MEMTIER_BENCHMARK_H
 #define _MEMTIER_BENCHMARK_H
 
+#include <stdint.h>
 #include <vector>
 #include "config_types.h"
 
@@ -47,6 +48,27 @@ enum PROTOCOL_TYPE {
     PROTOCOL_RESP3,
     PROTOCOL_MEMCACHE_TEXT,
     PROTOCOL_MEMCACHE_BINARY,
+};
+
+struct benchmark_config;
+
+class burst_controller {
+public:
+    explicit burst_controller(const benchmark_config* cfg);
+    ~burst_controller();
+
+    int start();
+    void stop();
+
+    double get_current_total_rate() const;
+    uint64_t get_rate_generation() const;
+
+private:
+    burst_controller(const burst_controller&);
+    burst_controller& operator=(const burst_controller&);
+
+    struct impl;
+    impl* m_impl;
 };
 
 struct benchmark_config {
@@ -107,6 +129,16 @@ struct benchmark_config {
     unsigned int request_rate;
     unsigned int request_per_interval;
     unsigned int request_interval_microsecond;
+    bool burst;
+    double burst_intensity_high;
+    double burst_intensity_low;
+    bool burst_intensity_high_set;
+    bool burst_intensity_low_set;
+    const char *burst_interval_spec;
+    const char *burst_duration_spec;
+    bool burst_interval_spec_set;
+    bool burst_duration_spec_set;
+    burst_controller* burst_controller_state;
 #ifdef USE_TLS
     bool tls;
     const char *tls_cert;

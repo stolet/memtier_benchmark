@@ -52,14 +52,17 @@
 #include "cluster_client.h"
 
 
-bool client::setup_client(benchmark_config *config, abstract_protocol *protocol, object_generator *objgen)
+bool client::setup_client(benchmark_config *config, abstract_protocol *protocol, object_generator *objgen,
+                          thread_rate_limiter* rate_limiter)
 {
     m_config = config;
+    m_thread_rate_limiter = rate_limiter;
     assert(m_config != NULL);
     unsigned long long total_num_of_clients = config->clients*config->threads;
 
     // create main connection
-    shard_connection* conn = new shard_connection(m_connections.size(), this, m_config, m_event_base, protocol);
+    shard_connection* conn = new shard_connection(m_connections.size(), this, m_config, m_event_base, protocol,
+                                                  m_thread_rate_limiter);
     m_connections.push_back(conn);
 
     m_obj_gen = objgen->clone();
@@ -101,14 +104,15 @@ bool client::setup_client(benchmark_config *config, abstract_protocol *protocol,
 
 client::client(client_group* group) :
         m_event_base(NULL), m_initialized(false), m_end_set(false), m_config(NULL),
-        m_obj_gen(NULL), m_stats(group->get_config()), m_reqs_processed(0), m_reqs_generated(0),
+        m_thread_rate_limiter(NULL), m_obj_gen(NULL), m_stats(group->get_config()), m_reqs_processed(0), m_reqs_generated(0),
         m_set_ratio_count(0), m_get_ratio_count(0),
         m_arbitrary_command_ratio_count(0), m_executed_command_index(0),
         m_tot_set_ops(0), m_tot_wait_ops(0)
 {
     m_event_base = group->get_event_base();
 
-    if (!setup_client(group->get_config(), group->get_protocol(), group->get_obj_gen())) {
+    if (!setup_client(group->get_config(), group->get_protocol(), group->get_obj_gen(),
+                      group->get_thread_rate_limiter())) {
         return;
     }
 
@@ -119,14 +123,14 @@ client::client(client_group* group) :
 client::client(struct event_base *event_base, benchmark_config *config,
                abstract_protocol *protocol, object_generator *obj_gen) :
         m_event_base(NULL), m_initialized(false), m_end_set(false), m_config(NULL),
-        m_obj_gen(NULL), m_stats(config), m_reqs_processed(0), m_reqs_generated(0),
+        m_thread_rate_limiter(NULL), m_obj_gen(NULL), m_stats(config), m_reqs_processed(0), m_reqs_generated(0),
         m_set_ratio_count(0), m_get_ratio_count(0),
         m_arbitrary_command_ratio_count(0), m_executed_command_index(0),
         m_tot_set_ops(0), m_tot_wait_ops(0), m_keylist(NULL)
 {
     m_event_base = event_base;
 
-    if (!setup_client(config, protocol, obj_gen)) {
+    if (!setup_client(config, protocol, obj_gen, NULL)) {
         return;
     }
 
@@ -581,14 +585,21 @@ bool verify_client::finished(void)
 
 ///////////////////////////////////////////////////////////////////////////
 
-client_group::client_group(benchmark_config* config, abstract_protocol *protocol, object_generator* obj_gen) :
-    m_base(NULL), m_config(config), m_protocol(protocol), m_obj_gen(obj_gen)
+client_group::client_group(benchmark_config* config, abstract_protocol *protocol, object_generator* obj_gen,
+                           unsigned int thread_id) :
+    m_base(NULL), m_config(config), m_protocol(protocol), m_obj_gen(obj_gen),
+    m_thread_id(thread_id), m_thread_rate_limiter(NULL)
 {
     m_base = event_base_new();
     assert(m_base != NULL);
 
     assert(protocol != NULL);
     assert(obj_gen != NULL);
+
+    if (m_config->burst) {
+        m_thread_rate_limiter = new thread_rate_limiter(m_base, m_config, m_thread_id);
+        assert(m_thread_rate_limiter != NULL);
+    }
 }
 
 client_group::~client_group(void)
@@ -598,6 +609,11 @@ client_group::~client_group(void)
         delete c;
     }
     m_clients.clear();
+
+    if (m_thread_rate_limiter != NULL) {
+        delete m_thread_rate_limiter;
+        m_thread_rate_limiter = NULL;
+    }
 
     if (m_base != NULL)
         event_base_free(m_base);

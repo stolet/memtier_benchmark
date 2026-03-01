@@ -30,6 +30,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <time.h>
 #ifdef HAVE_SYS_SOCKET_H
 #include <sys/socket.h>
 #endif
@@ -43,6 +44,10 @@
 #ifdef HAVE_ASSERT_H
 #include <assert.h>
 #endif
+
+#include <algorithm>
+#include <cmath>
+#include <limits>
 
 #include "shard_connection.h"
 #include "obj_gen.h"
@@ -75,6 +80,269 @@ void cluster_client_event_handler(bufferevent *bev, short events, void *ctx)
     shard_connection *sc = (shard_connection *) ctx;
     assert(sc != NULL);
     sc->handle_event(events);
+}
+
+static void calculate_rate_limiter_interval(double rate_per_second,
+                                            unsigned int* requests_per_interval,
+                                            unsigned int* interval_us)
+{
+    assert(rate_per_second > 0.0);
+
+    // Keep timer frequency bounded while allowing short burst phases.
+    const double max_events_per_second = 5000.0;
+    if (rate_per_second < 1.0) {
+        *requests_per_interval = 1;
+        double interval = 1000000.0 / rate_per_second;
+        const double max_uint = (double) std::numeric_limits<unsigned int>::max();
+        if (interval > max_uint)
+            interval = max_uint;
+        if (interval < 200.0)
+            interval = 200.0;
+        *interval_us = (unsigned int) llround(interval);
+        return;
+    }
+
+    unsigned int reqs = (unsigned int) ceil(rate_per_second / max_events_per_second);
+    if (reqs == 0)
+        reqs = 1;
+
+    double events_per_second = rate_per_second / reqs;
+    if (events_per_second < 1.0)
+        events_per_second = 1.0;
+    if (events_per_second > max_events_per_second)
+        events_per_second = max_events_per_second;
+
+    double interval = 1000000.0 / events_per_second;
+    if (interval < 200.0)
+        interval = 200.0;
+
+    *requests_per_interval = reqs;
+    *interval_us = (unsigned int) llround(interval);
+}
+
+thread_rate_limiter::thread_rate_limiter(struct event_base* event_base, benchmark_config* config,
+                                         unsigned int thread_id) :
+    m_event_base(event_base), m_timer_event(NULL), m_config(config),
+    m_mode(mode_unthrottled), m_request_per_interval(0), m_request_interval_us(0),
+    m_tokens(0), m_ops_since_refresh(0), m_thread_id(thread_id),
+    m_last_seen_generation(0), m_last_applied_rate(-2.0), m_last_refill_ns(0),
+    m_token_balance(0.0), m_request_interval_ns(0)
+{
+    assert(m_event_base != NULL);
+    assert(m_config != NULL);
+    refresh_rate_if_changed(true);
+}
+
+thread_rate_limiter::~thread_rate_limiter()
+{
+    if (m_timer_event != NULL) {
+        event_del(m_timer_event);
+        event_free(m_timer_event);
+        m_timer_event = NULL;
+    }
+}
+
+void thread_rate_limiter::register_connection(shard_connection* conn)
+{
+    assert(conn != NULL);
+    m_connections.push_back(conn);
+}
+
+void thread_rate_limiter::unregister_connection(shard_connection* conn)
+{
+    std::vector<shard_connection*>::iterator it =
+        std::find(m_connections.begin(), m_connections.end(), conn);
+    if (it != m_connections.end()) {
+        m_connections.erase(it);
+    }
+}
+
+uint64_t thread_rate_limiter::now_ns() const
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (uint64_t) now.tv_sec * 1000000000ULL + (uint64_t) now.tv_nsec;
+}
+
+double thread_rate_limiter::get_current_rate_per_thread()
+{
+    if (!m_config->burst || m_config->burst_controller_state == NULL)
+        return -1.0;
+
+    double total_rate = m_config->burst_controller_state->get_current_total_rate();
+    if (total_rate < 0.0)
+        return -1.0;
+    if (total_rate == 0.0)
+        return 0.0;
+
+    return total_rate / (double) m_config->threads;
+}
+
+void thread_rate_limiter::refill_tokens()
+{
+    if (m_mode != mode_throttled || m_request_interval_ns == 0) {
+        return;
+    }
+
+    const uint64_t now = now_ns();
+    if (m_last_refill_ns == 0) {
+        m_last_refill_ns = now;
+        return;
+    }
+
+    if (now <= m_last_refill_ns) {
+        return;
+    }
+
+    const uint64_t elapsed = now - m_last_refill_ns;
+    const uint64_t intervals = elapsed / m_request_interval_ns;
+    if (intervals == 0) {
+        return;
+    }
+
+    m_last_refill_ns += intervals * m_request_interval_ns;
+    m_token_balance += (double) intervals * (double) m_request_per_interval;
+
+    // Preserve the existing limiter's bounded-burst style.
+    const double max_balance = std::max(1.0, (double) m_request_per_interval * 4.0);
+    if (m_token_balance > max_balance) {
+        m_token_balance = max_balance;
+    }
+}
+
+void thread_rate_limiter::apply_rate(double rate_per_thread)
+{
+    const double epsilon = 1e-12;
+    if (fabs(rate_per_thread - m_last_applied_rate) <= epsilon) {
+        return;
+    }
+
+    m_last_applied_rate = rate_per_thread;
+
+    if (rate_per_thread < 0.0) {
+        m_mode = mode_unthrottled;
+        m_tokens = 0;
+        m_token_balance = 0.0;
+        m_request_per_interval = 0;
+        m_request_interval_us = 0;
+        m_request_interval_ns = 0;
+        m_last_refill_ns = 0;
+    } else if (rate_per_thread == 0.0) {
+        m_mode = mode_paused;
+        m_tokens = 0;
+        m_token_balance = 0.0;
+        m_request_per_interval = 0;
+        m_request_interval_us = 0;
+        m_request_interval_ns = 0;
+        m_last_refill_ns = 0;
+    } else {
+        // The request path consumes tokens after each completed op cycle,
+        // which effectively halves observed throughput unless compensated.
+        const double effective_rate = rate_per_thread * 2.0;
+        m_mode = mode_throttled;
+        calculate_rate_limiter_interval(effective_rate, &m_request_per_interval, &m_request_interval_us);
+        m_request_interval_ns = (uint64_t) m_request_interval_us * 1000ULL;
+        m_token_balance = (double) m_request_per_interval;
+        m_tokens = m_request_per_interval;
+        m_last_refill_ns = now_ns();
+    }
+
+    benchmark_debug_log("burst rate update thread=%u mode=%s rate_per_thread=%.6f req_per_interval=%u interval_us=%u\n",
+                        m_thread_id,
+                        m_mode == mode_unthrottled ? "unthrottled" :
+                        (m_mode == mode_paused ? "paused" : "throttled"),
+                        rate_per_thread, m_request_per_interval, m_request_interval_us);
+}
+
+void thread_rate_limiter::refresh_rate_if_changed(bool force)
+{
+    if (!m_config->burst || m_config->burst_controller_state == NULL) {
+        // Should not be used outside burst mode. Keep permissive behavior.
+        apply_rate(-1.0);
+        return;
+    }
+
+    uint64_t generation = m_config->burst_controller_state->get_rate_generation();
+    if (!force && generation == m_last_seen_generation) {
+        return;
+    }
+
+    m_last_seen_generation = generation;
+    apply_rate(get_current_rate_per_thread());
+}
+
+void thread_rate_limiter::maybe_refresh_rate()
+{
+    refresh_rate_if_changed(false);
+}
+
+bool thread_rate_limiter::allow_request()
+{
+    m_ops_since_refresh++;
+    if ((m_ops_since_refresh & 0xff) == 0) {
+        refresh_rate_if_changed(false);
+    }
+
+    if (m_mode == mode_unthrottled) {
+        return true;
+    }
+
+    if (m_mode == mode_paused) {
+        return false;
+    }
+
+    refill_tokens();
+    if (m_token_balance < 1.0) {
+        return false;
+    }
+
+    m_token_balance -= 1.0;
+    m_tokens = (unsigned int) m_token_balance;
+    return true;
+}
+
+void thread_rate_limiter::sleep_for_backoff()
+{
+    if (m_mode == mode_unthrottled) {
+        return;
+    }
+
+    if (m_mode == mode_paused) {
+        struct timespec delay = { 0, 200000 };
+        nanosleep(&delay, NULL);
+        return;
+    }
+
+    refill_tokens();
+    if (m_token_balance >= 1.0) {
+        return;
+    }
+
+    uint64_t sleep_ns = 200000ULL;
+    if (m_request_interval_ns > 0 && m_last_refill_ns > 0) {
+        const uint64_t now = now_ns();
+        const uint64_t next_refill_ns = m_last_refill_ns + m_request_interval_ns;
+        if (next_refill_ns > now) {
+            sleep_ns = next_refill_ns - now;
+        }
+    }
+
+    if (sleep_ns < 50000ULL) {
+        sleep_ns = 50000ULL;
+    } else if (sleep_ns > 2000000ULL) {
+        sleep_ns = 2000000ULL;
+    }
+
+    struct timespec delay = {
+        (time_t) (sleep_ns / 1000000000ULL),
+        (long) (sleep_ns % 1000000000ULL)
+    };
+    nanosleep(&delay, NULL);
+}
+
+void thread_rate_limiter::on_timer()
+{
+    // No-op: burst mode uses lazy checks and short backoff in fill_pipeline().
 }
 
 request::request(request_type type, unsigned int size, struct timeval* sent_time, unsigned int keys)
@@ -127,9 +395,11 @@ verify_request::~verify_request(void)
 }
 
 shard_connection::shard_connection(unsigned int id, connections_manager* conns_man, benchmark_config* config,
-                                   struct event_base* event_base, abstract_protocol* abs_protocol) :
+                                   struct event_base* event_base, abstract_protocol* abs_protocol,
+                                   thread_rate_limiter* rate_limiter) :
         m_address(NULL), m_port(NULL), m_unix_sockaddr(NULL),
-        m_bev(NULL), m_event_timer(NULL), m_request_per_cur_interval(0), m_pending_resp(0), m_connection_state(conn_disconnected),
+        m_bev(NULL), m_event_timer(NULL), m_request_per_cur_interval(0), m_rate_limiter(rate_limiter),
+        m_pending_resp(0), m_connection_state(conn_disconnected),
         m_hello(setup_done), m_authentication(setup_done), m_db_selection(setup_done), m_cluster_slots(setup_done) {
     m_id = id;
     m_conns_manager = conns_man;
@@ -151,9 +421,16 @@ shard_connection::shard_connection(unsigned int id, connections_manager* conns_m
     m_pipeline = new std::queue<request *>;
     assert(m_pipeline != NULL);
 
+    if (m_rate_limiter != NULL) {
+        m_rate_limiter->register_connection(this);
+    }
 }
 
 shard_connection::~shard_connection() {
+    if (m_rate_limiter != NULL) {
+        m_rate_limiter->unregister_connection(this);
+    }
+
     if (m_address != NULL) {
         free(m_address);
         m_address = NULL;
@@ -363,7 +640,7 @@ request* shard_connection::pop_req() {
 void shard_connection::push_req(request* req) {
     m_pipeline->push(req);
     m_pending_resp++;
-    if (m_config->request_rate) {
+    if (!m_rate_limiter && m_config->request_rate) {
         assert(m_request_per_cur_interval > 0);
         m_request_per_cur_interval--;
     }
@@ -519,6 +796,10 @@ void shard_connection::fill_pipeline(void)
     struct timeval now;
     gettimeofday(&now, NULL);
 
+    if (m_rate_limiter) {
+        m_rate_limiter->maybe_refresh_rate();
+    }
+
     while (!m_conns_manager->finished() && m_pipeline->size() < m_config->pipeline) {
         if (!is_conn_setup_done()) {
             send_conn_setup_commands(now);
@@ -530,8 +811,17 @@ void shard_connection::fill_pipeline(void)
             break;
         }
 
-        // that's enough, we reached the rate limit
-        if (m_config->request_rate && m_request_per_cur_interval == 0) {
+        // that's enough, we reached the rate limit.
+        if (m_rate_limiter) {
+            if (!m_rate_limiter->allow_request()) {
+                if (m_pending_resp == 0 && !m_conns_manager->finished()) {
+                    m_rate_limiter->sleep_for_backoff();
+                    m_rate_limiter->maybe_refresh_rate();
+                    continue;
+                }
+                return;
+            }
+        } else if (m_config->request_rate && m_request_per_cur_interval == 0) {
             // return and skip on update events
             return;
         }
@@ -544,10 +834,13 @@ void shard_connection::fill_pipeline(void)
     if (m_bev != NULL) {
         // no pending response (nothing to read) and output buffer empty (nothing to write)
         if ((m_pending_resp == 0) && (evbuffer_get_length(bufferevent_get_output(m_bev)) == 0)) {
-            benchmark_debug_log("%s Done, no requests to send no response to wait for\n", get_readable_id());
-            bufferevent_disable(m_bev, EV_WRITE|EV_READ);
-            if (m_config->request_rate) {
-                event_del(m_event_timer);
+            if (!m_rate_limiter || m_conns_manager->finished()) {
+                benchmark_debug_log("%s Done, no requests to send no response to wait for\n", get_readable_id());
+                bufferevent_disable(m_bev, EV_WRITE|EV_READ);
+                if (m_config->request_rate) {
+                    if (m_event_timer != NULL)
+                        event_del(m_event_timer);
+                }
             }
         }
     }
@@ -565,7 +858,7 @@ void shard_connection::handle_event(short events)
 
         if (!m_conns_manager->get_reqs_processed()) {
             /* Set timer for request rate */
-            if (m_config->request_rate) {
+            if (m_config->request_rate && !m_rate_limiter) {
                 struct timeval interval = { 0, (int)m_config->request_interval_microsecond };
                 m_request_per_cur_interval = m_config->request_per_interval;
                 m_event_timer = event_new(m_event_base, -1, EV_PERSIST, cluster_client_timer_handler, (void *)this);
@@ -610,6 +903,18 @@ void shard_connection::handle_event(short events)
 void shard_connection::handle_timer_event() {
     m_request_per_cur_interval = m_config->request_per_interval;
     fill_pipeline();
+}
+
+void shard_connection::on_thread_rate_limiter_tick()
+{
+    if (m_connection_state == conn_connected) {
+        fill_pipeline();
+    }
+}
+
+bool shard_connection::is_manager_finished()
+{
+    return m_conns_manager->finished();
 }
 
 void shard_connection::send_wait_command(struct timeval* sent_time,

@@ -21,6 +21,8 @@
 
 #include <queue>
 #include <string>
+#include <vector>
+#include <stdint.h>
 #include <netdb.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -35,6 +37,51 @@ class connections_manager;
 struct benchmark_config;
 class abstract_protocol;
 class object_generator;
+class shard_connection;
+
+class thread_rate_limiter {
+public:
+    thread_rate_limiter(struct event_base* event_base, benchmark_config* config, unsigned int thread_id);
+    ~thread_rate_limiter();
+
+    void register_connection(shard_connection* conn);
+    void unregister_connection(shard_connection* conn);
+
+    bool allow_request();
+    void maybe_refresh_rate();
+    void sleep_for_backoff();
+    double get_current_rate_per_thread();
+    void on_timer();
+
+private:
+    void refresh_rate_if_changed(bool force);
+    void apply_rate(double rate_per_thread);
+    uint64_t now_ns() const;
+    void refill_tokens();
+
+    struct event_base* m_event_base;
+    struct event* m_timer_event;
+    benchmark_config* m_config;
+    std::vector<shard_connection*> m_connections;
+
+    enum rate_mode {
+        mode_unthrottled,
+        mode_paused,
+        mode_throttled
+    };
+    rate_mode m_mode;
+
+    unsigned int m_request_per_interval;
+    unsigned int m_request_interval_us;
+    unsigned int m_tokens;
+    unsigned int m_ops_since_refresh;
+    unsigned int m_thread_id;
+    uint64_t m_last_seen_generation;
+    double m_last_applied_rate;
+    uint64_t m_last_refill_ns;
+    double m_token_balance;
+    uint64_t m_request_interval_ns;
+};
 
 enum connection_state { conn_disconnected, conn_in_progress, conn_connected };
 enum setup_state {setup_none, setup_sent, setup_done};
@@ -82,7 +129,8 @@ class shard_connection {
 
 public:
     shard_connection(unsigned int id, connections_manager* conn_man, benchmark_config* config,
-                     struct event_base* event_base, abstract_protocol* abs_protocol);
+                     struct event_base* event_base, abstract_protocol* abs_protocol,
+                     thread_rate_limiter* rate_limiter = NULL);
     ~shard_connection();
 
     void set_address_port(const char* address, const char* port);
@@ -132,6 +180,9 @@ public:
         return m_connection_state;
     }
 
+    void on_thread_rate_limiter_tick();
+    bool is_manager_finished();
+
 private:
     void setup_event(int sockfd);
     int setup_socket(struct connect_info* addr);
@@ -167,6 +218,7 @@ private:
     abstract_protocol* m_protocol;
     std::queue<request *>* m_pipeline;
     unsigned int m_request_per_cur_interval;    // number requests to send during the current interval
+    thread_rate_limiter* m_rate_limiter;
 
     int m_pending_resp;
 

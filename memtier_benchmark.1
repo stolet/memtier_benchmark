@@ -104,6 +104,25 @@ use 'allkeys' to run on the entire key\-range
 The max number of requests to make per second from an individual connection (default is unlimited rate).
 If you use \fB\-\-rate\-limiting\fR and a very large rate is entered which cannot be met, memtier will do as many requests as possible per second.
 .TP
+\fB\-\-burst\fR
+Enable tenant\-wide bursty open\-loop rate control.
+.TP
+\fB\-\-burst\-intensity\-high\fR=\fI\,VAL\/\fR
+HIGH phase total target req/s for the whole process.
+Use \-1 for unthrottled, or 0 for no traffic.
+.TP
+\fB\-\-burst\-intensity\-low\fR=\fI\,VAL\/\fR
+LOW phase total target req/s for the whole process.
+Use \-1 for unthrottled, or 0 for no traffic.
+.TP
+\fB\-\-burst\-interval\fR=\fI\,SPEC\/\fR
+LOW phase duration distribution in milliseconds:
+constant,<ms> | normal,<mean_ms>,<stddev_ms> | lognormal,<mu>,<sigma>
+.TP
+\fB\-\-burst\-duration\fR=\fI\,SPEC\/\fR
+HIGH phase duration distribution in milliseconds:
+constant,<ms> | normal,<mean_ms>,<stddev_ms> | lognormal,<mu>,<sigma>
+.TP
 \fB\-c\fR, \fB\-\-clients\fR=\fI\,NUMBER\/\fR
 Number of clients per thread (default: 50)
 .TP
