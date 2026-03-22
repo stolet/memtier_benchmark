@@ -440,6 +440,7 @@ static void config_print(FILE *file, struct benchmark_config *cfg)
         "clients = %u\n"
         "threads = %u\n"
         "max_pending_connects = %u\n"
+        "connect_wait = %u\n"
         "test_time = %u\n"
         "ratio = %u:%u\n"
         "pipeline = %u\n"
@@ -491,6 +492,7 @@ static void config_print(FILE *file, struct benchmark_config *cfg)
         cfg->clients,
         cfg->threads,
         cfg->max_pending_connects,
+        cfg->connect_wait,
         cfg->test_time,
         cfg->ratio.a, cfg->ratio.b,
         cfg->pipeline,
@@ -562,6 +564,7 @@ static void config_print_to_json(json_handler * jsonhandler, struct benchmark_co
     jsonhandler->write_obj("clients"           ,"%u",          	cfg->clients);
     jsonhandler->write_obj("threads"           ,"%u",          	cfg->threads);
     jsonhandler->write_obj("max_pending_connects","%u",         cfg->max_pending_connects);
+    jsonhandler->write_obj("connect_wait"      ,"%u",          cfg->connect_wait);
     jsonhandler->write_obj("test_time"         ,"%u",          	cfg->test_time);
     jsonhandler->write_obj("ratio"             ,"\"%u:%u\"",   	cfg->ratio.a, cfg->ratio.b);
     jsonhandler->write_obj("pipeline"          ,"%u",          	cfg->pipeline);
@@ -613,6 +616,8 @@ static void config_init_defaults(struct benchmark_config *cfg)
         cfg->clients = 50;
     if (!cfg->threads)
         cfg->threads = 4;
+    if (!cfg->connect_wait_set)
+        cfg->connect_wait = 10;
     if (!cfg->ratio.is_defined())
         cfg->ratio = config_ratio("1:10");
     if (!cfg->pipeline)
@@ -770,6 +775,7 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         o_ratio,
         o_pipeline,
         o_max_pending_connects,
+        o_connect_wait,
         o_data_size_range,
         o_data_size_list,
         o_data_size_pattern,
@@ -851,6 +857,7 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         { "clients",                    1, 0, 'c' },
         { "threads",                    1, 0, 't' },
         { "max-pending-connects",       1, 0, o_max_pending_connects },
+        { "connect-wait",               1, 0, o_connect_wait },
         { "test-time",                  1, 0, o_test_time },
         { "ratio",                      1, 0, o_ratio },
         { "pipeline",                   1, 0, o_pipeline },
@@ -1032,6 +1039,19 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
                         fprintf(stderr, "error: max-pending-connects must be greater than or equal to zero.\n");
                         return -1;
                     }
+                    break;
+                case o_connect_wait:
+                    endptr = NULL;
+                    if (optarg[0] == '-') {
+                        fprintf(stderr, "error: connect-wait must be greater than or equal to zero.\n");
+                        return -1;
+                    }
+                    cfg->connect_wait = (unsigned int) strtoul(optarg, &endptr, 10);
+                    if (!endptr || *endptr != '\0') {
+                        fprintf(stderr, "error: connect-wait must be greater than or equal to zero.\n");
+                        return -1;
+                    }
+                    cfg->connect_wait_set = true;
                     break;
                 case o_test_time:
                     endptr = NULL;
@@ -1437,6 +1457,7 @@ void usage() {
             "  -c, --clients=NUMBER           Number of clients per thread (default: 50)\n"
             "  -t, --threads=NUMBER           Number of threads (default: 4)\n"
             "      --max-pending-connects=NUM Maximum number of pending startup connects per thread (default: 0, unlimited)\n"
+            "      --connect-wait=SECS        Seconds to wait after launching connections before sending traffic (default: 10)\n"
             "      --test-time=SECS           Number of seconds to run the test\n"
             "      --ratio=RATIO              Set:Get ratio (default: 1:10)\n"
             "      --pipeline=NUMBER          Number of concurrent pipelined requests (default: 1)\n"
@@ -1627,7 +1648,8 @@ run_stats run_benchmark(int run_id, benchmark_config* cfg, object_generator* obj
     for (std::vector<cg_thread*>::iterator i = threads.begin(); i != threads.end(); i++) {
         (*i)->start();
     }
-    sleep(10);
+    if (cfg->connect_wait)
+        sleep(cfg->connect_wait);
 
     pthread_barrier_wait(&barrier);
 

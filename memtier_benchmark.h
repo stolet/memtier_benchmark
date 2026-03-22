@@ -92,6 +92,8 @@ struct benchmark_config {
     unsigned int clients;
     unsigned int threads;
     unsigned int max_pending_connects;
+    unsigned int connect_wait;
+    bool connect_wait_set;
     unsigned int test_time;
     config_ratio ratio;
     unsigned int pipeline;

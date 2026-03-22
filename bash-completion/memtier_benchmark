@@ -19,7 +19,7 @@ _memtier_look_for_element () {
 _memtier_completions()
 {
 	 options_no_comp=("--server" "--port" "--unix-socket" "--out-file" "--client-stats" "--run-count" "--clients"\
-	                  "--requests" "--threads" "--max-pending-connects" "--test-time" "--ratio" "--pipeline" "--data-size" "--data-offset"\
+	                  "--requests" "--threads" "--max-pending-connects" "--connect-wait" "--test-time" "--ratio" "--pipeline" "--data-size" "--data-offset"\
 	                  "--data-size-range" "--data-size-list" "--expiry-range" "--data-import" "--key-prefix"\
 	                  "--key-minimum" "--key-maximum" "--reconnect-interval" "--multi-key-get" "--authenticate"\
 	                  "--select-db" "--wait-ratio" "--num-slaves" "--wait-timeout" "--json-out-file"\
