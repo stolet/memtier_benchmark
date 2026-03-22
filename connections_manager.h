@@ -36,6 +36,7 @@ public:
 
     virtual void create_request(struct timeval timestamp, unsigned int conn_id) = 0;
     virtual bool hold_pipeline(unsigned int conn_id) = 0;
+    virtual bool requests_enabled(void) = 0;
     virtual void notify_connect_finished(unsigned int conn_id) = 0;
 
     virtual int connect(void) = 0;

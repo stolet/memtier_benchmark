@@ -230,6 +230,18 @@ void client::notify_connect_finished(unsigned int conn_id)
         m_group->on_client_initial_connect_finished(this);
 }
 
+bool client::requests_enabled(void)
+{
+    return m_group == NULL || m_group->requests_enabled();
+}
+
+void client::start_benchmark(void)
+{
+    for (unsigned int i = 0; i < m_connections.size(); i++) {
+        m_connections[i]->start_benchmark();
+    }
+}
+
 bool client::finished(void)
 {
     if (m_config->requests > 0 && m_reqs_processed >= m_config->requests)
@@ -606,9 +618,9 @@ bool verify_client::finished(void)
 ///////////////////////////////////////////////////////////////////////////
 
 client_group::client_group(benchmark_config* config, abstract_protocol *protocol, object_generator* obj_gen,
-                           unsigned int thread_id) :
+                           std::atomic<bool>* start_requests, unsigned int thread_id) :
     m_base(NULL), m_config(config), m_protocol(protocol), m_obj_gen(obj_gen),
-    m_thread_id(thread_id), m_thread_rate_limiter(NULL), m_pending_startup_connects(0)
+    m_thread_id(thread_id), m_thread_rate_limiter(NULL), m_pending_startup_connects(0), m_start_requests(start_requests)
 {
     m_base = event_base_new();
     assert(m_base != NULL);
@@ -729,6 +741,18 @@ void client_group::on_client_initial_connect_finished(client* c)
     if (start_pending_initial_connects() < 0) {
         benchmark_error_log("prepare: failed to connect, test aborted.\n");
         event_base_loopexit(m_base, NULL);
+    }
+}
+
+void client_group::warmup(void)
+{
+    event_base_loop(m_base, EVLOOP_NONBLOCK);
+}
+
+void client_group::start_benchmark(void)
+{
+    for (std::vector<client*>::iterator i = m_clients.begin(); i != m_clients.end(); i++) {
+        (*i)->start_benchmark();
     }
 }
 

@@ -27,6 +27,7 @@
 #include <vector>
 #include <queue>
 #include <iterator>
+#include <atomic>
 #include <event2/event.h>
 #include <event2/buffer.h>
 
@@ -126,7 +127,9 @@ public:
     virtual void set_end_time();
     virtual void create_request(struct timeval timestamp, unsigned int conn_id);
     virtual bool hold_pipeline(unsigned int conn_id);
+    virtual bool requests_enabled(void);
     virtual void notify_connect_finished(unsigned int conn_id);
+    virtual void start_benchmark(void);
     virtual int connect(void);
     virtual void disconnect(void);
     //
@@ -209,13 +212,16 @@ protected:
     std::vector<client*> m_clients;
     std::queue<client*> m_pending_startup_clients;
     unsigned int m_pending_startup_connects;
+    std::atomic<bool>* m_start_requests;
 public:
     client_group(benchmark_config *cfg, abstract_protocol *protocol, object_generator* obj_gen,
-                 unsigned int thread_id = 0);
+                 std::atomic<bool>* start_requests, unsigned int thread_id = 0);
     ~client_group();
 
     int create_clients(int count);
     int prepare(void);
+    void warmup(void);
+    void start_benchmark(void);
     void run(void);
 
     void write_client_stats(const char *prefix);
@@ -225,6 +231,7 @@ public:
     abstract_protocol* get_protocol(void) { return m_protocol; }
     object_generator* get_obj_gen(void) { return m_obj_gen; }
     thread_rate_limiter* get_thread_rate_limiter(void) { return m_thread_rate_limiter; }
+    bool requests_enabled(void) const { return m_start_requests == NULL || m_start_requests->load(); }
 
     unsigned long int get_total_bytes(void);
     unsigned long int get_total_ops(void);

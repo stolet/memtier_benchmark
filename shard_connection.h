@@ -138,6 +138,7 @@ public:
 
     int connect(struct connect_info* addr);
     void disconnect();
+    void start_benchmark();
 
     void send_wait_command(struct timeval* sent_time,
                             unsigned int num_slaves, unsigned int timeout);
