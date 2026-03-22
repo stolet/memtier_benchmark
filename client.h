@@ -56,9 +56,12 @@ protected:
 
     std::vector<shard_connection*> m_connections;
 
+    client_group* m_group;
     struct event_base* m_event_base;
     bool m_initialized;
     bool m_end_set;
+    bool m_initial_startup_connect_started;
+    bool m_initial_startup_connect_finished;
 
     // test related
     benchmark_config* m_config;
@@ -123,6 +126,7 @@ public:
     virtual void set_end_time();
     virtual void create_request(struct timeval timestamp, unsigned int conn_id);
     virtual bool hold_pipeline(unsigned int conn_id);
+    virtual void notify_connect_finished(unsigned int conn_id);
     virtual int connect(void);
     virtual void disconnect(void);
     //
@@ -203,6 +207,8 @@ protected:
     unsigned int m_thread_id;
     thread_rate_limiter* m_thread_rate_limiter;
     std::vector<client*> m_clients;
+    std::queue<client*> m_pending_startup_clients;
+    unsigned int m_pending_startup_connects;
 public:
     client_group(benchmark_config *cfg, abstract_protocol *protocol, object_generator* obj_gen,
                  unsigned int thread_id = 0);
@@ -226,6 +232,11 @@ public:
     unsigned long int get_duration_usec(void);
 
     void merge_run_stats(run_stats* target);
+    void on_client_initial_connect_finished(client* c);
+
+protected:
+    int start_initial_client_connect(client* c);
+    int start_pending_initial_connects(void);
 };
 
 

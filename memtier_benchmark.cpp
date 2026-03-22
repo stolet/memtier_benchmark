@@ -439,6 +439,7 @@ static void config_print(FILE *file, struct benchmark_config *cfg)
         "rate_limit = %u\n"
         "clients = %u\n"
         "threads = %u\n"
+        "max_pending_connects = %u\n"
         "test_time = %u\n"
         "ratio = %u:%u\n"
         "pipeline = %u\n"
@@ -489,6 +490,7 @@ static void config_print(FILE *file, struct benchmark_config *cfg)
         cfg->request_rate,
         cfg->clients,
         cfg->threads,
+        cfg->max_pending_connects,
         cfg->test_time,
         cfg->ratio.a, cfg->ratio.b,
         cfg->pipeline,
@@ -559,6 +561,7 @@ static void config_print_to_json(json_handler * jsonhandler, struct benchmark_co
     jsonhandler->write_obj("rate_limit"        ,"%u",         	cfg->request_rate);
     jsonhandler->write_obj("clients"           ,"%u",          	cfg->clients);
     jsonhandler->write_obj("threads"           ,"%u",          	cfg->threads);
+    jsonhandler->write_obj("max_pending_connects","%u",         cfg->max_pending_connects);
     jsonhandler->write_obj("test_time"         ,"%u",          	cfg->test_time);
     jsonhandler->write_obj("ratio"             ,"\"%u:%u\"",   	cfg->ratio.a, cfg->ratio.b);
     jsonhandler->write_obj("pipeline"          ,"%u",          	cfg->pipeline);
@@ -666,6 +669,9 @@ static bool verify_cluster_option(struct benchmark_config *cfg) {
     } else if (cfg->multi_key_get) {
         fprintf(stderr, "error: cluster mode dose not support multi-key-get option.\n");
         return false;
+    } else if (cfg->max_pending_connects) {
+        fprintf(stderr, "error: cluster mode dose not support max-pending-connects option.\n");
+        return false;
     } else if (cfg->wait_ratio.is_defined()) {
         fprintf(stderr, "error: cluster mode dose not support wait-ratio option.\n");
         return false;
@@ -763,6 +769,7 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         o_test_time = 128,
         o_ratio,
         o_pipeline,
+        o_max_pending_connects,
         o_data_size_range,
         o_data_size_list,
         o_data_size_pattern,
@@ -843,6 +850,7 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
         { "requests",                   1, 0, 'n' },
         { "clients",                    1, 0, 'c' },
         { "threads",                    1, 0, 't' },
+        { "max-pending-connects",       1, 0, o_max_pending_connects },
         { "test-time",                  1, 0, o_test_time },
         { "ratio",                      1, 0, o_ratio },
         { "pipeline",                   1, 0, o_pipeline },
@@ -1010,6 +1018,18 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
                     cfg->threads = (unsigned int) strtoul(optarg, &endptr, 10);
                     if (!cfg->threads || !endptr || *endptr != '\0') {
                         fprintf(stderr, "error: threads must be greater than zero.\n");
+                        return -1;
+                    }
+                    break;
+                case o_max_pending_connects:
+                    endptr = NULL;
+                    if (optarg[0] == '-') {
+                        fprintf(stderr, "error: max-pending-connects must be greater than or equal to zero.\n");
+                        return -1;
+                    }
+                    cfg->max_pending_connects = (unsigned int) strtoul(optarg, &endptr, 10);
+                    if (!endptr || *endptr != '\0') {
+                        fprintf(stderr, "error: max-pending-connects must be greater than or equal to zero.\n");
                         return -1;
                     }
                     break;
@@ -1416,6 +1436,7 @@ void usage() {
             "                                 constant,<ms> | normal,<mean_ms>,<stddev_ms> | lognormal,<mu>,<sigma>\n"
             "  -c, --clients=NUMBER           Number of clients per thread (default: 50)\n"
             "  -t, --threads=NUMBER           Number of threads (default: 4)\n"
+            "      --max-pending-connects=NUM Maximum number of pending startup connects per thread (default: 0, unlimited)\n"
             "      --test-time=SECS           Number of seconds to run the test\n"
             "      --ratio=RATIO              Set:Get ratio (default: 1:10)\n"
             "      --pipeline=NUMBER          Number of concurrent pipelined requests (default: 1)\n"

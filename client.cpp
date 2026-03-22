@@ -103,11 +103,10 @@ bool client::setup_client(benchmark_config *config, abstract_protocol *protocol,
 }
 
 client::client(client_group* group) :
-        m_event_base(NULL), m_initialized(false), m_end_set(false), m_config(NULL),
-        m_thread_rate_limiter(NULL), m_obj_gen(NULL), m_stats(group->get_config()), m_reqs_processed(0), m_reqs_generated(0),
-        m_set_ratio_count(0), m_get_ratio_count(0),
-        m_arbitrary_command_ratio_count(0), m_executed_command_index(0),
-        m_tot_set_ops(0), m_tot_wait_ops(0)
+        m_group(group), m_event_base(NULL), m_initialized(false), m_end_set(false), m_initial_startup_connect_started(false),
+        m_initial_startup_connect_finished(false), m_config(NULL), m_thread_rate_limiter(NULL), m_obj_gen(NULL),
+        m_stats(group->get_config()), m_reqs_processed(0), m_reqs_generated(0), m_set_ratio_count(0), m_get_ratio_count(0),
+        m_arbitrary_command_ratio_count(0), m_executed_command_index(0), m_tot_set_ops(0), m_tot_wait_ops(0), m_keylist(NULL)
 {
     m_event_base = group->get_event_base();
 
@@ -122,11 +121,10 @@ client::client(client_group* group) :
 
 client::client(struct event_base *event_base, benchmark_config *config,
                abstract_protocol *protocol, object_generator *obj_gen) :
-        m_event_base(NULL), m_initialized(false), m_end_set(false), m_config(NULL),
-        m_thread_rate_limiter(NULL), m_obj_gen(NULL), m_stats(config), m_reqs_processed(0), m_reqs_generated(0),
-        m_set_ratio_count(0), m_get_ratio_count(0),
-        m_arbitrary_command_ratio_count(0), m_executed_command_index(0),
-        m_tot_set_ops(0), m_tot_wait_ops(0), m_keylist(NULL)
+        m_group(NULL), m_event_base(NULL), m_initialized(false), m_end_set(false), m_initial_startup_connect_started(false),
+        m_initial_startup_connect_finished(false), m_config(NULL), m_thread_rate_limiter(NULL), m_obj_gen(NULL),
+        m_stats(config), m_reqs_processed(0), m_reqs_generated(0), m_set_ratio_count(0), m_get_ratio_count(0),
+        m_arbitrary_command_ratio_count(0), m_executed_command_index(0), m_tot_set_ops(0), m_tot_wait_ops(0), m_keylist(NULL)
 {
     m_event_base = event_base;
 
@@ -173,6 +171,7 @@ void client::disconnect(void)
 int client::connect(void)
 {
     struct connect_info addr;
+    bool track_initial_connect = false;
 
     // get primary connection
     shard_connection* sc = MAIN_CONNECTION;
@@ -202,12 +201,33 @@ int client::connect(void)
         sc->set_address_port(address, port_str);
     }
 
+    if (m_group != NULL && m_config->max_pending_connects > 0 &&
+        !m_initial_startup_connect_started && !m_initial_startup_connect_finished &&
+        sc->get_id() == 0) {
+        m_initial_startup_connect_started = true;
+        track_initial_connect = true;
+    }
+
     // call connect
     int ret = sc->connect(&addr);
-    if (ret)
+    if (ret) {
+        if (track_initial_connect)
+            m_initial_startup_connect_finished = true;
         return ret;
+    }
 
     return 0;
+}
+
+void client::notify_connect_finished(unsigned int conn_id)
+{
+    if (conn_id != 0 || !m_initial_startup_connect_started || m_initial_startup_connect_finished)
+        return;
+
+    m_initial_startup_connect_finished = true;
+
+    if (m_group != NULL)
+        m_group->on_client_initial_connect_finished(this);
 }
 
 bool client::finished(void)
@@ -588,7 +608,7 @@ bool verify_client::finished(void)
 client_group::client_group(benchmark_config* config, abstract_protocol *protocol, object_generator* obj_gen,
                            unsigned int thread_id) :
     m_base(NULL), m_config(config), m_protocol(protocol), m_obj_gen(obj_gen),
-    m_thread_id(thread_id), m_thread_rate_limiter(NULL)
+    m_thread_id(thread_id), m_thread_rate_limiter(NULL), m_pending_startup_connects(0)
 {
     m_base = event_base_new();
     assert(m_base != NULL);
@@ -645,16 +665,71 @@ int client_group::create_clients(int num)
 
 int client_group::prepare(void)
 {
-   for (std::vector<client*>::iterator i = m_clients.begin(); i != m_clients.end(); i++) {
-        client* c = *i;
-        int ret = c->prepare();
+    if (!m_config->max_pending_connects) {
+        for (std::vector<client*>::iterator i = m_clients.begin(); i != m_clients.end(); i++) {
+            client* c = *i;
+            int ret = c->prepare();
 
-        if (ret < 0) {
-            return ret;
+            if (ret < 0) {
+                return ret;
+            }
         }
-   }
 
-   return 0;
+        return 0;
+    }
+
+    while (!m_pending_startup_clients.empty())
+        m_pending_startup_clients.pop();
+    m_pending_startup_connects = 0;
+
+    for (std::vector<client*>::iterator i = m_clients.begin(); i != m_clients.end(); i++) {
+        m_pending_startup_clients.push(*i);
+    }
+
+    return start_pending_initial_connects();
+}
+
+int client_group::start_initial_client_connect(client* c)
+{
+    int ret = c->prepare();
+    if (ret < 0)
+        return ret;
+
+    m_pending_startup_connects++;
+    return 0;
+}
+
+int client_group::start_pending_initial_connects(void)
+{
+    unsigned int limit = m_config->max_pending_connects;
+    if (!limit)
+        return 0;
+
+    while (m_pending_startup_connects < limit && !m_pending_startup_clients.empty()) {
+        client* c = m_pending_startup_clients.front();
+        m_pending_startup_clients.pop();
+
+        int ret = start_initial_client_connect(c);
+        if (ret < 0)
+            return ret;
+    }
+
+    return 0;
+}
+
+void client_group::on_client_initial_connect_finished(client* c)
+{
+    (void) c;
+
+    if (!m_config->max_pending_connects || m_pending_startup_connects == 0)
+        return;
+
+    m_pending_startup_connects--;
+
+    if (start_pending_initial_connects() < 0) {
+        benchmark_error_log("prepare: failed to connect, test aborted.\n");
+        event_base_loopexit(m_base, NULL);
+    }
 }
 
 void client_group::run(void)

@@ -854,6 +854,7 @@ void shard_connection::handle_event(short events)
 
     if ((get_connection_state() == conn_in_progress) && (events & BEV_EVENT_CONNECTED)) {
         m_connection_state = conn_connected;
+        m_conns_manager->notify_connect_finished(m_id);
         bufferevent_enable(m_bev, EV_READ|EV_WRITE);
 
         if (!m_conns_manager->get_reqs_processed()) {
@@ -887,6 +888,8 @@ void shard_connection::handle_event(short events)
         if (!ssl_error && errno) {
             benchmark_error_log("Connection error: %s\n", strerror(errno));
         }
+        if (get_connection_state() == conn_in_progress)
+            m_conns_manager->notify_connect_finished(m_id);
         disconnect();
 
         return;
@@ -894,6 +897,8 @@ void shard_connection::handle_event(short events)
 
     if (events & BEV_EVENT_EOF) {
         benchmark_error_log("connection dropped.\n");
+        if (get_connection_state() == conn_in_progress)
+            m_conns_manager->notify_connect_finished(m_id);
         disconnect();
 
         return;
