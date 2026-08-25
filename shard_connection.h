@@ -49,7 +49,6 @@ public:
 
     bool allow_request();
     void maybe_refresh_rate();
-    void sleep_for_backoff();
     double get_current_rate_per_thread();
     void on_timer();
 
@@ -58,9 +57,14 @@ private:
     void apply_rate(double rate_per_thread);
     uint64_t now_ns() const;
     void refill_tokens();
+    void schedule_next_wakeup();
+    void schedule_wakeup_at(uint64_t target_ns);
+    void cancel_wakeup();
 
     struct event_base* m_event_base;
     struct event* m_timer_event;
+    bool m_timer_scheduled;
+    uint64_t m_timer_due_ns;
     benchmark_config* m_config;
     std::vector<shard_connection*> m_connections;
 

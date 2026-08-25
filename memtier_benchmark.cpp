@@ -413,6 +413,11 @@ uint64_t burst_controller::get_rate_generation() const
     return m_impl->rate_generation.load(std::memory_order_acquire);
 }
 
+uint64_t burst_controller::get_phase_end_time_ns() const
+{
+    return m_impl->phase_end_time_ns.load(std::memory_order_acquire);
+}
+
 static void config_print(FILE *file, struct benchmark_config *cfg)
 {
     char tmpbuf[512];

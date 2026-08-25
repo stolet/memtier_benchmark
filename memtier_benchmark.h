@@ -62,6 +62,7 @@ public:
 
     double get_current_total_rate() const;
     uint64_t get_rate_generation() const;
+    uint64_t get_phase_end_time_ns() const;
 
 private:
     burst_controller(const burst_controller&);

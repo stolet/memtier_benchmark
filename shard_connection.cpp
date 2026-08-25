@@ -82,6 +82,16 @@ void cluster_client_event_handler(bufferevent *bev, short events, void *ctx)
     sc->handle_event(events);
 }
 
+void thread_rate_limiter_timer_handler(evutil_socket_t fd, short what, void *ctx)
+{
+    (void) fd;
+    (void) what;
+
+    thread_rate_limiter *limiter = (thread_rate_limiter *) ctx;
+    assert(limiter != NULL);
+    limiter->on_timer();
+}
+
 static void calculate_rate_limiter_interval(double rate_per_second,
                                             unsigned int* requests_per_interval,
                                             unsigned int* interval_us)
@@ -122,7 +132,8 @@ static void calculate_rate_limiter_interval(double rate_per_second,
 
 thread_rate_limiter::thread_rate_limiter(struct event_base* event_base, benchmark_config* config,
                                          unsigned int thread_id) :
-    m_event_base(event_base), m_timer_event(NULL), m_config(config),
+    m_event_base(event_base), m_timer_event(NULL), m_timer_scheduled(false), m_timer_due_ns(0),
+    m_config(config),
     m_mode(mode_unthrottled), m_request_per_interval(0), m_request_interval_us(0),
     m_tokens(0), m_ops_since_refresh(0), m_thread_id(thread_id),
     m_last_seen_generation(0), m_last_applied_rate(-2.0), m_last_refill_ns(0),
@@ -130,13 +141,15 @@ thread_rate_limiter::thread_rate_limiter(struct event_base* event_base, benchmar
 {
     assert(m_event_base != NULL);
     assert(m_config != NULL);
+    m_timer_event = evtimer_new(m_event_base, thread_rate_limiter_timer_handler, this);
+    assert(m_timer_event != NULL);
     refresh_rate_if_changed(true);
 }
 
 thread_rate_limiter::~thread_rate_limiter()
 {
     if (m_timer_event != NULL) {
-        event_del(m_timer_event);
+        cancel_wakeup();
         event_free(m_timer_event);
         m_timer_event = NULL;
     }
@@ -210,6 +223,66 @@ void thread_rate_limiter::refill_tokens()
     }
 }
 
+void thread_rate_limiter::cancel_wakeup()
+{
+    if (!m_timer_scheduled) {
+        return;
+    }
+
+    event_del(m_timer_event);
+    m_timer_scheduled = false;
+    m_timer_due_ns = 0;
+}
+
+void thread_rate_limiter::schedule_wakeup_at(uint64_t target_ns)
+{
+    const uint64_t current_ns = now_ns();
+    if (target_ns <= current_ns) {
+        target_ns = current_ns + 1000ULL;
+    }
+
+    if (m_timer_scheduled && m_timer_due_ns <= target_ns) {
+        return;
+    }
+
+    cancel_wakeup();
+
+    const uint64_t delay_ns = target_ns - current_ns;
+    const uint64_t delay_us = (delay_ns + 999ULL) / 1000ULL;
+    struct timeval timeout = {
+        (time_t) (delay_us / 1000000ULL),
+        (suseconds_t) (delay_us % 1000000ULL)
+    };
+
+    if (evtimer_add(m_timer_event, &timeout) == 0) {
+        m_timer_scheduled = true;
+        m_timer_due_ns = target_ns;
+    }
+}
+
+void thread_rate_limiter::schedule_next_wakeup()
+{
+    const uint64_t current_ns = now_ns();
+
+    if (m_mode == mode_paused) {
+        uint64_t target_ns = current_ns + 200000ULL;
+        if (m_config->burst_controller_state != NULL) {
+            const uint64_t phase_end_ns =
+                m_config->burst_controller_state->get_phase_end_time_ns();
+            if (phase_end_ns > current_ns) {
+                target_ns = phase_end_ns;
+            }
+        }
+        schedule_wakeup_at(target_ns);
+        return;
+    }
+
+    if (m_mode == mode_throttled && m_request_interval_ns > 0 && m_last_refill_ns > 0) {
+        const uint64_t next_refill_ns = m_last_refill_ns + m_request_interval_ns;
+        schedule_wakeup_at(next_refill_ns);
+    }
+}
+
 void thread_rate_limiter::apply_rate(double rate_per_thread)
 {
     const double epsilon = 1e-12;
@@ -218,6 +291,7 @@ void thread_rate_limiter::apply_rate(double rate_per_thread)
     }
 
     m_last_applied_rate = rate_per_thread;
+    cancel_wakeup();
 
     if (rate_per_thread < 0.0) {
         m_mode = mode_unthrottled;
@@ -288,11 +362,13 @@ bool thread_rate_limiter::allow_request()
     }
 
     if (m_mode == mode_paused) {
+        schedule_next_wakeup();
         return false;
     }
 
     refill_tokens();
     if (m_token_balance < 1.0) {
+        schedule_next_wakeup();
         return false;
     }
 
@@ -301,48 +377,19 @@ bool thread_rate_limiter::allow_request()
     return true;
 }
 
-void thread_rate_limiter::sleep_for_backoff()
-{
-    if (m_mode == mode_unthrottled) {
-        return;
-    }
-
-    if (m_mode == mode_paused) {
-        struct timespec delay = { 0, 200000 };
-        nanosleep(&delay, NULL);
-        return;
-    }
-
-    refill_tokens();
-    if (m_token_balance >= 1.0) {
-        return;
-    }
-
-    uint64_t sleep_ns = 200000ULL;
-    if (m_request_interval_ns > 0 && m_last_refill_ns > 0) {
-        const uint64_t now = now_ns();
-        const uint64_t next_refill_ns = m_last_refill_ns + m_request_interval_ns;
-        if (next_refill_ns > now) {
-            sleep_ns = next_refill_ns - now;
-        }
-    }
-
-    if (sleep_ns < 50000ULL) {
-        sleep_ns = 50000ULL;
-    } else if (sleep_ns > 2000000ULL) {
-        sleep_ns = 2000000ULL;
-    }
-
-    struct timespec delay = {
-        (time_t) (sleep_ns / 1000000000ULL),
-        (long) (sleep_ns % 1000000000ULL)
-    };
-    nanosleep(&delay, NULL);
-}
-
 void thread_rate_limiter::on_timer()
 {
-    // No-op: burst mode uses lazy checks and short backoff in fill_pipeline().
+    m_timer_scheduled = false;
+    m_timer_due_ns = 0;
+    refresh_rate_if_changed(false);
+
+    // A connection may unregister while handling an event, so iterate over a
+    // stable snapshot of the current connections.
+    const std::vector<shard_connection*> connections = m_connections;
+    for (std::vector<shard_connection*>::const_iterator it = connections.begin();
+         it != connections.end(); ++it) {
+        (*it)->on_thread_rate_limiter_tick();
+    }
 }
 
 request::request(request_type type, unsigned int size, struct timeval* sent_time, unsigned int keys)
@@ -808,15 +855,14 @@ void shard_connection::start_benchmark()
 
 void shard_connection::fill_pipeline(void)
 {
-    struct timeval now;
-    gettimeofday(&now, NULL);
-
     if (m_rate_limiter) {
         m_rate_limiter->maybe_refresh_rate();
     }
 
     while (!m_conns_manager->finished() && m_pipeline->size() < m_config->pipeline) {
         if (!is_conn_setup_done()) {
+            struct timeval now;
+            gettimeofday(&now, NULL);
             send_conn_setup_commands(now);
             return;
         }
@@ -829,11 +875,6 @@ void shard_connection::fill_pipeline(void)
         // that's enough, we reached the rate limit.
         if (m_rate_limiter) {
             if (!m_rate_limiter->allow_request()) {
-                if (m_pending_resp == 0 && !m_conns_manager->finished()) {
-                    m_rate_limiter->sleep_for_backoff();
-                    m_rate_limiter->maybe_refresh_rate();
-                    continue;
-                }
                 return;
             }
         } else if (m_config->request_rate && m_request_per_cur_interval == 0) {
@@ -842,6 +883,8 @@ void shard_connection::fill_pipeline(void)
         }
 
         // client manage requests logic
+        struct timeval now;
+        gettimeofday(&now, NULL);
         m_conns_manager->create_request(now, m_id);
     }
 
